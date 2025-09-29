@@ -25,15 +25,16 @@ def _parse_time(time_UTC: Union[datetime, str, list, np.ndarray]) -> np.ndarray:
         Array of datetime64 objects.
     """
     if isinstance(time_UTC, (str, datetime)):
-        return np.array([pd.to_datetime(time_UTC)])
+        return np.array([time_UTC], dtype='datetime64[ns]')
     
     # If already array-like
-    arr = np.array(time_UTC)
+    arr = np.asarray(time_UTC)
     
     if np.issubdtype(arr.dtype, np.datetime64):
-        return pd.to_datetime(arr)
+        return arr
     
-    return pd.to_datetime(arr)
+    # Use numpy's datetime conversion for better performance
+    return np.array(arr, dtype='datetime64[ns]')
 
 def _broadcast_time_and_space(times: np.ndarray, lons: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -60,7 +61,23 @@ def _broadcast_time_and_space(times: np.ndarray, lons: np.ndarray) -> tuple[np.n
     if lons.shape == ():
         lons = lons[None]
 
-    return np.broadcast_arrays(times[..., None], lons)
+    # For 1D arrays, create proper broadcasting
+    if times.ndim == 1 and lons.ndim == 1:
+        if times.shape[0] == 1:
+            # Single time, multiple lons: repeat time for each lon
+            times_b = np.repeat(times, lons.shape[0])
+            lons_b = lons
+        elif lons.shape[0] == 1:
+            # Multiple times, single lon: repeat lon for each time  
+            times_b = times
+            lons_b = np.repeat(lons, times.shape[0])
+        else:
+            # Both are multi-element: use meshgrid for full cross-product
+            times_b, lons_b = np.meshgrid(times, lons, indexing='ij')
+        return times_b, lons_b
+    else:
+        # Use numpy's broadcasting for higher dimensions
+        return np.broadcast_arrays(times, lons)
 
 def extract_lat_lon(geometry: Union[SpatialGeometry, GeoSeries]) -> SpatialGeometry:
     """
@@ -117,8 +134,10 @@ def calculate_solar_hour_of_day(
     """
     times = _parse_time(time_UTC)
 
-    if lat is None or lon is None and geometry is not None:
+    if (lat is None or lon is None) and geometry is not None:
         lat, lon = extract_lat_lon(geometry)
+    elif lon is None:
+        raise ValueError("longitude is required when geometry is not provided")
 
     times = np.asarray(times)
     lon = np.asarray(lon)
@@ -172,23 +191,10 @@ def calculate_solar_day_of_year(
     """
     times = _parse_time(time_UTC)
 
-    # # If latitude is not provided, try to extract from geometry
-    # if lat is None and isinstance(geometry, SpatialGeometry):
-    #     lat = geometry.lat
-    # elif lat is None and isinstance(geometry, GeoSeries):
-    #     lat = geometry.y
-    # elif lat is None:
-    #     raise ValueError("no latitude provided")
-
-    # if lon is None and isinstance(geometry, SpatialGeometry):
-    #     lon = geometry.lon
-    # elif lon is None and isinstance(geometry, GeoSeries):
-    #     lon = geometry.x
-    # elif lon is None:
-    #     raise ValueError("no longitude provided")
-
-    if lat is None or lon is None and geometry is not None:
+    if (lat is None or lon is None) and geometry is not None:
         lat, lon = extract_lat_lon(geometry)
+    elif lon is None:
+        raise ValueError("longitude is required when geometry is not provided")
 
     # Handle 1D time and lon inputs of the same length: pair element-wise
     times = np.asarray(times)
@@ -200,10 +206,10 @@ def calculate_solar_day_of_year(
         # Broadcast to 2D if not matching 1D
         times_b, lons_b = _broadcast_time_and_space(times, lon)
 
-    # Vectorized conversion to pandas datetime and dayofyear extraction
-    times_b_flat = times_b.flatten()
-    times_b_dt = pd.to_datetime(times_b_flat)
-    doy_UTC = times_b_dt.dayofyear.values.reshape(times_b.shape)
+    # More efficient day of year extraction using numpy datetime operations
+    # Convert to datetime64[D] (days since epoch) and then calculate day of year
+    year_start = times_b.astype('datetime64[Y]')  # Start of each year
+    doy_UTC = ((times_b.astype('datetime64[D]') - year_start.astype('datetime64[D]')) + 1).astype(int)
 
     hour_UTC = (
         times_b.astype('datetime64[h]').astype(int) % 24
@@ -214,8 +220,22 @@ def calculate_solar_day_of_year(
     offset = np.radians(lons_b) / np.pi * 12
     hour_of_day = hour_UTC + offset
     day_of_year = doy_UTC.copy()
+    
+    # Adjust day of year for timezone offsets
     day_of_year = np.where(hour_of_day < 0, day_of_year - 1, day_of_year)
     day_of_year = np.where(hour_of_day > 24, day_of_year + 1, day_of_year)
+    
+    # Handle boundary conditions - clamp to valid day range for the year
+    # Note: This assumes we want to stay within the same calendar year
+    # Day 0 becomes day 1, day > 365/366 becomes last day of year
+    day_of_year = np.maximum(day_of_year, 1)
+    
+    # Get the actual last day of the year for each time
+    year_values = times_b.astype('datetime64[Y]').astype(int) + 1970
+    # Check if leap year: divisible by 4, but not by 100 unless also by 400
+    is_leap = ((year_values % 4 == 0) & (year_values % 100 != 0)) | (year_values % 400 == 0)
+    max_day = np.where(is_leap, 366, 365)
+    day_of_year = np.minimum(day_of_year, max_day)
 
     return day_of_year
 
@@ -332,17 +352,32 @@ def solar_day_of_year_for_longitude(
     float or np.ndarray
         The calculated day of year.
     """
-    # Calculate the day of year at the given longitude
-    DOY_UTC = time_UTC.timetuple().tm_yday
-    hour_UTC = time_UTC.hour + time_UTC.minute / 60 + time_UTC.second / 3600
-    offset = UTC_offset_hours_for_longitude(lon)
-    hour_of_day = hour_UTC + offset
-    DOY = DOY_UTC
-    # Adjust the day of year if the hour of day is outside the range [0, 24]
-    DOY = np.where(hour_of_day < 0, DOY - 1, DOY)
-    DOY = np.where(hour_of_day > 24, DOY + 1, DOY)
+    # Support single datetime or list/array/Series of datetimes
+    import numpy as np
+    import pandas as pd
 
-    return DOY
+    def process_single_time(single_time, lon):
+        DOY_UTC = single_time.timetuple().tm_yday
+        hour_UTC = single_time.hour + single_time.minute / 60 + single_time.second / 3600
+        offset = UTC_offset_hours_for_longitude(lon)
+        hour_of_day = hour_UTC + offset
+        DOY = DOY_UTC
+        # Adjust the day of year if the hour of day is outside the range [0, 24]
+        if hour_of_day < 0:
+            DOY -= 1
+        if hour_of_day > 24:
+            DOY += 1
+        return DOY
+
+    # Handle list, np.ndarray, pd.Series
+    if isinstance(time_UTC, (list, np.ndarray, pd.Series)):
+        # If lon is array-like, broadcast
+        if isinstance(lon, (list, np.ndarray, pd.Series)):
+            return np.array([process_single_time(t, l) for t, l in zip(time_UTC, lon)])
+        else:
+            return np.array([process_single_time(t, lon) for t in time_UTC])
+    else:
+        return process_single_time(time_UTC, lon)
 
 def solar_hour_of_day_for_area(time_UTC: datetime, geometry: rt.RasterGeometry) -> rt.Raster:
     """
